@@ -17,6 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger("gemini")
 
 # ---------- 配置 ----------
+API_KEY      = os.getenv("API_KEY")
 SECURE_C_SES = os.getenv("SECURE_C_SES")
 HOST_C_OSES  = os.getenv("HOST_C_OSES")
 CSESIDX      = os.getenv("CSESIDX")
@@ -43,6 +44,23 @@ http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
 )
+
+# ---------- API Key 验证 ----------
+async def verify_api_key(request: Request) -> None:
+    """验证 API Key，如果未配置则跳过验证"""
+    if API_KEY is None:
+        return
+    
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    
+    client_key = auth_header[7:]  # Remove "Bearer " prefix
+    if client_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ---------- 工具函数 ----------
 def get_common_headers(jwt: str) -> dict:
@@ -285,7 +303,8 @@ def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: 
     return json.dumps(chunk)
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    await verify_api_key(request)
     data = []
     now = int(time.time())
     for m in MODEL_MAPPING.keys():
@@ -303,7 +322,8 @@ async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 @app.post("/v1/chat/completions")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    await verify_api_key(request)
     # 1. 模型校验
     if req.model not in MODEL_MAPPING:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not found.")
@@ -479,5 +499,8 @@ if __name__ == "__main__":
     if not all([SECURE_C_SES, CSESIDX, CONFIG_ID]):
         print("Error: Missing required environment variables.")
         exit(1)
+    if not (API_KEY):
+        print("Error: Missing API_KEY variables.")
+        exit(1)
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
