@@ -9,4 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY main.py .
 COPY database.py .
+COPY static/ ./static/
+
 CMD ["python", "-u", "main.py"]
