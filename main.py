@@ -2,11 +2,19 @@ import json, time, hmac, hashlib, base64, os, asyncio, uuid, ssl, re
 from datetime import datetime
 from typing import List, Optional, Union, Dict, Any
 import logging
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from dotenv import load_dotenv
+# Load .env file first
+load_dotenv()
+
+from database import db  # Import database instance
 
 # ---------- 日志配置 ----------
 logging.basicConfig(
@@ -18,10 +26,12 @@ logger = logging.getLogger("gemini")
 
 # ---------- 配置 ----------
 API_KEY      = os.getenv("API_KEY")
-SECURE_C_SES = os.getenv("SECURE_C_SES")
-HOST_C_OSES  = os.getenv("HOST_C_OSES")
-CSESIDX      = os.getenv("CSESIDX")
-CONFIG_ID    = os.getenv("CONFIG_ID")
+# Fallsback ENV variables (customary support)
+ENV_SECURE_C_SES = os.getenv("SECURE_C_SES")
+ENV_HOST_C_OSES  = os.getenv("HOST_C_OSES")
+ENV_CSESIDX      = os.getenv("CSESIDX")
+ENV_CONFIG_ID    = os.getenv("CONFIG_ID")
+
 PROXY        = os.getenv("PROXY") or None
 TIMEOUT_SECONDS = 600 
 
@@ -33,34 +43,14 @@ MODEL_MAPPING = {
     "gemini-3-pro-preview": "gemini-3-pro-preview"
 }
 
-# ---------- 全局 Session 缓存 ----------
-SESSION_CACHE: Dict[str, dict] = {}
-
 # ---------- HTTP 客户端 ----------
 http_client = httpx.AsyncClient(
-    proxies=PROXY,
+    proxy=PROXY,
     verify=False,
     http2=False,
     timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
 )
-
-# ---------- API Key 验证 ----------
-async def verify_api_key(request: Request) -> None:
-    """验证 API Key，如果未配置则跳过验证"""
-    if API_KEY is None:
-        return
-    
-    auth_header = request.headers.get("authorization")
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="Missing API key")
-    
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header format")
-    
-    client_key = auth_header[7:]  # Remove "Bearer " prefix
-    if client_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ---------- 工具函数 ----------
 def get_common_headers(jwt: str) -> dict:
@@ -113,9 +103,10 @@ def create_jwt(key_bytes: bytes, key_id: str, csesidx: str) -> str:
     sig         = hmac.new(key_bytes, message.encode(), hashlib.sha256).digest()
     return f"{message}.{urlsafe_b64encode(sig)}"
 
-# ---------- JWT 管理 ----------
+# ---------- JWT 管理 (Per Account) ----------
 class JWTManager:
-    def __init__(self) -> None:
+    def __init__(self, account_data: dict) -> None:
+        self.account = account_data
         self.jwt: str = ""
         self.expires: float = 0
         self._lock = asyncio.Lock()
@@ -127,47 +118,140 @@ class JWTManager:
             return self.jwt
 
     async def _refresh(self) -> None:
-        cookie = f"__Secure-C_SES={SECURE_C_SES}"
-        if HOST_C_OSES:
-            cookie += f"; __Host-C_OSES={HOST_C_OSES}"
+        cookie = f"__Secure-C_SES={self.account['secure_c_ses']}"
+        if self.account.get('host_c_oses'):
+            cookie += f"; __Host-C_OSES={self.account['host_c_oses']}"
         
-        logger.debug("🔑 正在刷新 JWT...")
-        r = await http_client.get(
-            "https://business.gemini.google/auth/getoxsrf",
-            params={"csesidx": CSESIDX},
-            headers={
-                "cookie": cookie,
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-                "referer": "https://business.gemini.google/"
-            },
-        )
-        if r.status_code != 200:
-            logger.error(f"❌ getoxsrf 失败: {r.status_code} {r.text}")
-            raise HTTPException(r.status_code, "getoxsrf failed")
+        logger.debug(f"🔑 [{self.account['id']}] 正在刷新 JWT...")
+        try:
+            r = await http_client.get(
+                "https://business.gemini.google/auth/getoxsrf",
+                params={"csesidx": self.account['csesidx']},
+                headers={
+                    "cookie": cookie,
+                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+                    "referer": "https://business.gemini.google/"
+                },
+            )
+            if r.status_code != 200:
+                logger.error(f"❌ [{self.account['id']}] getoxsrf 失败: {r.status_code} {r.text}")
+                raise HTTPException(r.status_code, "getoxsrf failed")
+            
+            txt = r.text[4:] if r.text.startswith(")]}'") else r.text
+            data = json.loads(txt)
+
+            key_bytes = base64.urlsafe_b64decode(data["xsrfToken"] + "==")
+            self.jwt     = create_jwt(key_bytes, data["keyId"], self.account['csesidx'])
+            self.expires = time.time() + 270
+            logger.info(f"✅ [{self.account['id']}] JWT 刷新成功")
+        except Exception as e:
+            logger.error(f"❌ [{self.account['id']}] JWT Refresh Error: {e}")
+            raise e
+
+# ---------- 账号与会话管理 ----------
+class Account:
+    def __init__(self, data: dict):
+        self.id = data.get("id") or 0
+        self.name = data.get("name") or f"Account-{self.id}"
+        self.secure_c_ses = data["secure_c_ses"]
+        self.host_c_oses = data.get("host_c_oses")
+        self.csesidx = data["csesidx"]
+        self.config_id = data["config_id"]
         
-        txt = r.text[4:] if r.text.startswith(")]}'") else r.text
-        data = json.loads(txt)
+        self.jwt_mgr = JWTManager(data)
+        self.lock = asyncio.Lock() # For account-level operations if needed
 
-        key_bytes = base64.urlsafe_b64decode(data["xsrfToken"] + "==")
-        self.jwt     = create_jwt(key_bytes, data["keyId"], CSESIDX)
-        self.expires = time.time() + 270
-        logger.info(f"✅ JWT 刷新成功")
+    async def get_jwt(self):
+        return await self.jwt_mgr.get()
 
-jwt_mgr = JWTManager()
+class AccountPool:
+    def __init__(self):
+        self.accounts: List[Account] = []
+        self._current_index = 0
+        self._lock = asyncio.Lock()
 
-# ---------- Session & File 管理 ----------
-async def create_google_session() -> str:
-    jwt = await jwt_mgr.get()
+    async def load_accounts(self):
+        try:
+            await db.connect()
+            rows = await db.fetch_active_accounts()
+            if rows:
+                self.accounts = [Account(row) for row in rows]
+                logger.info(f"📚 已从数据库加载 {len(self.accounts)} 个账号")
+            else:
+                logger.info("⚠️ 数据库中无可用账号，尝试使用环境变量 fallback")
+                await self._load_fallback()
+        except Exception as e:
+            logger.error(f"❌ 加载账号失败: {e}")
+            await self._load_fallback()
+
+    async def _load_fallback(self):
+        if all([ENV_SECURE_C_SES, ENV_CSESIDX, ENV_CONFIG_ID]):
+            fallback_data = {
+                "id": 0,
+                "name": "Env-Fallback",
+                "secure_c_ses": ENV_SECURE_C_SES,
+                "host_c_oses": ENV_HOST_C_OSES,
+                "csesidx": ENV_CSESIDX,
+                "config_id": ENV_CONFIG_ID
+            }
+            self.accounts = [Account(fallback_data)]
+            logger.info("✅ 已加载环境变量 fallback 账号")
+        else:
+            logger.warning("❌ 未找到任何可用账号配置")
+
+    async def get_next_account(self) -> Optional[Account]:
+        """Failover Mode: Always return the first active account."""
+        async with self._lock:
+            if not self.accounts: return None
+
+            # Always pick the FIRST active account (Primary)
+            # This ensures stickiness unless the primary account fails/is disabled.
+            # No Round-Robin rotation.
+            for acc in self.accounts:
+                if acc.id > 0: # Check real active flag if needed, but assuming self.accounts list is filtered/managed
+                     # Actually self.accounts contains all. We rely on is_active in DB, but here we only have loaded accounts
+                     pass
+            
+            # Simple approach: Return the first account. 
+            # In a real failover system, we might want to check health, but here we just return index 0
+            if self.accounts:
+                 # Update usage stats for the primary account
+                 if self.accounts[0].id > 0:
+                     asyncio.create_task(db.update_account_usage(self.accounts[0].id))
+                 return self.accounts[0]
+            
+            return None
+
+    def get_account_by_id(self, account_id: int) -> Optional[Account]:
+        for acc in self.accounts:
+            if acc.id == account_id:
+                return acc
+        return None
+
+account_pool = AccountPool()
+
+# 全局 Session 缓存 (Extended)
+# Key: conv_key
+# Value: {"session_id": str, "account_id": int, "updated_at": float}
+SESSION_CACHE: Dict[str, dict] = {}
+
+# 用户模型偏好缓存 (Model Stickiness)
+# Key: client_ip
+# Value: last_stream_model_name
+USER_MODEL_PREF: Dict[str, str] = {}
+
+async def create_google_session(account: Account) -> str:
+    jwt = await account.get_jwt()
     headers = get_common_headers(jwt)
     body = {
-        "configId": CONFIG_ID,
+        "configId": account.config_id,
         "additionalParams": {"token": "-"},
         "createSessionRequest": {
             "session": {"name": "", "displayName": ""}
         }
     }
     
-    logger.debug("🌐 申请新 Session...")
+    logger.debug(f"🌐 [{account.name}] 申请新 Session...")
     r = await http_client.post(
         "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetCreateSession",
         headers=headers,
@@ -179,9 +263,9 @@ async def create_google_session() -> str:
     sess_name = r.json()["session"]["name"]
     return sess_name
 
-async def upload_context_file(session_name: str, mime_type: str, base64_content: str) -> str:
+async def upload_context_file(account: Account, session_name: str, mime_type: str, base64_content: str) -> str:
     """上传文件到指定 Session，返回 fileId"""
-    jwt = await jwt_mgr.get()
+    jwt = await account.get_jwt()
     headers = get_common_headers(jwt)
     
     # 生成随机文件名
@@ -189,7 +273,7 @@ async def upload_context_file(session_name: str, mime_type: str, base64_content:
     file_name = f"upload_{int(time.time())}_{uuid.uuid4().hex[:6]}.{ext}"
 
     body = {
-        "configId": CONFIG_ID,
+        "configId": account.config_id,
         "additionalParams": {"token": "-"},
         "addContextFileRequest": {
             "name": session_name,
@@ -199,7 +283,7 @@ async def upload_context_file(session_name: str, mime_type: str, base64_content:
         }
     }
 
-    logger.info(f"📤 上传图片 [{mime_type}] 到 Session...")
+    logger.info(f"📤 [{account.name}] 上传图片 [{mime_type}] 到 Session...")
     r = await http_client.post(
         "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetAddContextFile",
         headers=headers,
@@ -214,6 +298,13 @@ async def upload_context_file(session_name: str, mime_type: str, base64_content:
     file_id = data.get("addContextFileResponse", {}).get("fileId")
     logger.info(f"✅ 图片上传成功, ID: {file_id}")
     return file_id
+
+# ---------- API Key 验证 ----------
+async def verify_api_key(request: Request) -> None:
+    if API_KEY is None: return
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer ") or auth_header[7:] != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ---------- 消息处理逻辑 ----------
 def get_conversation_key(messages: List[dict]) -> str:
@@ -257,29 +348,110 @@ def parse_last_message(messages: List['Message']):
     return text_content, images
 
 def build_full_context_text(messages: List['Message']) -> str:
-    """仅拼接历史文本，图片只处理当次请求的"""
+    """仅拼接历史文本，图片只处理当次请求的。兼容处理 Tool Messages。"""
     prompt = ""
     for msg in messages:
-        role = "User" if msg.role in ["user", "system"] else "Assistant"
+        role = msg.role
+        if role in ["user", "system"]:
+            role_name = "User"
+        elif role == "assistant":
+            role_name = "Assistant"
+        elif role == "tool":
+            role_name = "Tool Output"
+        else:
+            role_name = "User" # Fallback
+
         content_str = ""
-        if isinstance(msg.content, str):
-            content_str = msg.content
-        elif isinstance(msg.content, list):
-            for part in msg.content:
-                if part.get("type") == "text":
-                    content_str += part.get("text", "")
-                elif part.get("type") == "image_url":
-                    content_str += "[图片]"
+        if msg.content:
+            if isinstance(msg.content, str):
+                content_str = msg.content
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.get("type") == "text":
+                        content_str += part.get("text", "")
+                    elif part.get("type") == "image_url":
+                        content_str += "[图片]"
         
-        prompt += f"{role}: {content_str}\n\n"
+        # Helper for tool calls in assistant message
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                func_name = tc.get("function", {}).get("name", "unknown")
+                args = tc.get("function", {}).get("arguments", "{}")
+                content_str += f"\n[Call Tool: {func_name}({args})]"
+
+        prompt += f"{role_name}: {content_str}\n\n"
     return prompt
 
+# ---------- FastAPI App & Lifespan ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await account_pool.load_accounts()
+    yield
+    # Shutdown
+    await db.disconnect()
+
 # ---------- OpenAI 兼容接口 ----------
-app = FastAPI(title="Gemini-Business OpenAI Gateway")
+app = FastAPI(title="Gemini-Business OpenAI Gateway", lifespan=lifespan)
+# Mount static files for Admin UI
+app.mount("/admin", StaticFiles(directory="static/admin", html=True), name="static")
+
+# Admin API Models
+class AccountCreate(BaseModel):
+    name: str = "New Account"
+    secure_c_ses: str
+    host_c_oses: Optional[str] = None
+    csesidx: str
+    config_id: str
+
+class AccountUpdate(BaseModel):
+    name: Optional[str] = None
+    secure_c_ses: Optional[str] = None
+    host_c_oses: Optional[str] = None
+    csesidx: Optional[str] = None
+    config_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+# Admin API Routes
+from fastapi import Depends
+
+@app.get("/api/admin/accounts", dependencies=[Depends(verify_api_key)])
+async def admin_list_accounts():
+    return await db.get_all_accounts()
+
+@app.post("/api/admin/accounts", dependencies=[Depends(verify_api_key)])
+async def admin_add_account(acc: AccountCreate):
+    await db.add_account(
+        name=acc.name,
+        secure_c_ses=acc.secure_c_ses,
+        host_c_oses=acc.host_c_oses,
+        csesidx=acc.csesidx,
+        config_id=acc.config_id
+    )
+    await account_pool.load_accounts() # Refresh pool
+    return {"status": "ok"}
+
+@app.put("/api/admin/accounts/{id}", dependencies=[Depends(verify_api_key)])
+async def admin_update_account(id: int, acc: AccountUpdate):
+    data = acc.dict(exclude_unset=True)
+    if not data: return {"status": "no change"}
+    await db.update_account(id, data)
+    await account_pool.load_accounts() # Refresh pool
+    return {"status": "ok"}
+
+@app.delete("/api/admin/accounts/{id}", dependencies=[Depends(verify_api_key)])
+async def admin_delete_account(id: int):
+    await db.delete_account(id)
+    await account_pool.load_accounts() # Refresh pool
+    return {"status": "ok"}
+
 
 class Message(BaseModel):
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Union[str, List[Dict[str, Any]], None] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 class ChatRequest(BaseModel):
     model: str = "gemini-auto"
@@ -287,6 +459,14 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
+    # OpenAI Compatibility Fields (Optional)
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    max_tokens: Optional[int] = None
+    n: Optional[int] = 1
+    presence_penalty: Optional[float] = 0
+    frequency_penalty: Optional[float] = 0
+    stop: Optional[Union[str, List[str]]] = None
 
 def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: Union[str, None]) -> str:
     chunk = {
@@ -319,35 +499,98 @@ async def list_models(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {
+        "status": "ok", 
+        "time": datetime.utcnow().isoformat(),
+        "accounts_loaded": len(account_pool.accounts)
+    }
 
 @app.post("/v1/chat/completions")
 async def chat(req: ChatRequest, request: Request):
     await verify_api_key(request)
     # 1. 模型校验
+    # 推断请求意图 (Intent Inference)
+    intent = "💬 主动对话 (Chat)" if req.stream else "🤖 后台任务 (Background/Title)"
+    
+    # DEBUG: Log raw received model with Intent
+    logger.info(f"📨 请求收到 | 类型: {intent} | 模型: [{req.model}] | 流式: {req.stream}")
+    
+    # --- 模型粘性与一致性策略 (Model Stickiness) ---
+    # 策略：以流式请求(Stream=True)为准，因为那是用户正在进行的真实对话。
+    # 非流式(Stream=False)通常是后台任务(如标题生成/摘要)，往往使用降级模型(2.5)。
+    # 我们记录用户最后一次流式请求使用的模型，并强制后续的非流式请求保持一致。
+    
+    client_ip = request.client.host if request.client else "global"
+    
+    if req.stream:
+        # 用户显式发起对话 -> 更新首选模型记录
+        USER_MODEL_PREF[client_ip] = req.model
+    else:
+        # 后台任务 -> 检查是否通过
+        preferred = USER_MODEL_PREF.get(client_ip)
+        if preferred and req.model != preferred:
+             # 如果后台请求的模型(如2.5)与用户首选(如3)不一致，强制升级
+             # 特例：如果用户真的想用2.5发非流式，这里会被误伤，但权衡之下，一致性优先
+             if "gemini-2.5" in req.model and "gemini-3" in preferred:
+                 logger.info(f"✨ [自动升级] 检测到后台降级请求 ({req.model}) -> 已自动修正为用户首选 ({preferred})")
+                 req.model = preferred
+
     if req.model not in MODEL_MAPPING:
+        # Auto-map common aliases if needed, but for now strict check
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not found.")
+
+    # 1.1 Compatibility Warning
+    if req.tools:
+        logger.warning(f"⚠️ 工具调用被忽略: 上游 Gemini Widget 接口暂不支持 Client-Side Tools")
 
     # 2. 解析请求内容
     last_text, current_images = parse_last_message(req.messages)
     
     # 3. 锚定 Session
-    conv_key = get_conversation_key([m.dict() for m in req.messages])
+    # Fix Pydantic V2 deprecation warning
+    conv_key = get_conversation_key([m.model_dump() for m in req.messages])
     cached = SESSION_CACHE.get(conv_key)
     
+    account: Optional[Account] = None
+    google_session: str = ""
+    is_retry_mode = False
+
+    # 3.1 尝试从缓存恢复
     if cached:
-        google_session = cached["session_id"]
-        text_to_send = last_text
-        logger.info(f"♻️ 延续旧对话 [{req.model}]: {google_session[-12:]}")
-        SESSION_CACHE[conv_key]["updated_at"] = time.time()
-        is_retry_mode = False
-    else:
-        logger.info(f"🆕 开启新对话 [{req.model}]")
-        google_session = await create_google_session()
-        # 新对话使用全量文本上下文 (图片只传当前的)
-        text_to_send = build_full_context_text(req.messages)
-        SESSION_CACHE[conv_key] = {"session_id": google_session, "updated_at": time.time()}
-        is_retry_mode = True
+        cached_acc_id = cached.get("account_id", 0)
+        account = account_pool.get_account_by_id(cached_acc_id)
+        
+        # 如果缓存的账号找不到了（比如被禁用），则需要重新开启新会话
+        if account:
+            google_session = cached["session_id"]
+            text_to_send = last_text
+            logger.info(f"♻️ 延续旧对话 [{req.model}][Acc:{account.id}]: {google_session[-12:]}")
+            SESSION_CACHE[conv_key]["updated_at"] = time.time()
+        else:
+            logger.warning(f"⚠️ 缓存账号 ID {cached_acc_id} 不可用，强制开启新对话")
+            cached = None # Treat as new
+
+    # 3.2 开启新会话 (如果需要)
+    if not cached:
+        account = await account_pool.get_next_account()
+        if not account:
+            raise HTTPException(status_code=503, detail="No active accounts available")
+        
+        logger.info(f"🛡️ [Primary/Sticky] Using Account: [{account.id}] {account.name}")
+        logger.info(f"🆕 开启新对话 [{req.model}][Acc:{account.id}]")
+        try:
+            google_session = await create_google_session(account)
+            # 新对话使用全量文本上下文 (图片只传当前的)
+            text_to_send = build_full_context_text(req.messages)
+            SESSION_CACHE[conv_key] = {
+                "session_id": google_session, 
+                "account_id": account.id,
+                "updated_at": time.time()
+            }
+            is_retry_mode = True
+        except Exception as e:
+            logger.error(f"❌ 开启会话失败: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create session: {e}")
 
     chat_id = f"chatcmpl-{uuid.uuid4()}"
     created_time = int(time.time())
@@ -360,18 +603,17 @@ async def chat(req: ChatRequest, request: Request):
         current_text = text_to_send
         current_retry_mode = is_retry_mode
         
-        # 图片 ID 列表 (每次 Session 变化都需要重新上传，因为 fileId 绑定在 Session 上)
+        # Important: Capture mutable variables for retry logic
+        current_sess = google_session
+        current_acc = account
         current_file_ids = []
 
         while retry_count <= max_retries:
             try:
-                current_session = SESSION_CACHE[conv_key]["session_id"]
-                
                 # A. 如果有图片且还没上传到当前 Session，先上传
-                # 注意：每次重试如果是新 Session，都需要重新上传图片
                 if current_images and not current_file_ids:
                     for img in current_images:
-                        fid = await upload_context_file(current_session, img["mime"], img["data"])
+                        fid = await upload_context_file(current_acc, current_sess, img["mime"], img["data"])
                         current_file_ids.append(fid)
 
                 # B. 准备文本 (重试模式下发全文)
@@ -380,7 +622,8 @@ async def chat(req: ChatRequest, request: Request):
 
                 # C. 发起对话
                 async for chunk in stream_chat_generator(
-                    current_session, 
+                    current_acc,
+                    current_sess, 
                     current_text, 
                     current_file_ids, 
                     req.model, 
@@ -396,12 +639,17 @@ async def chat(req: ChatRequest, request: Request):
                 logger.warning(f"⚠️ 请求异常 (重试 {retry_count}/{max_retries}): {e}")
 
                 if retry_count <= max_retries:
+                    # 尝试重建 Session (仍使用当前账号)
                     logger.info("🔄 尝试重建 Session...")
                     try:
-                        new_sess = await create_google_session()
-                        SESSION_CACHE[conv_key] = {"session_id": new_sess, "updated_at": time.time()}
+                        new_sess = await create_google_session(current_acc)
+                        if conv_key in SESSION_CACHE:
+                            SESSION_CACHE[conv_key]["session_id"] = new_sess
+                            # account_id keeps same
+                        
+                        current_sess = new_sess
                         current_retry_mode = True 
-                        current_file_ids = [] # 清空 ID，强制下次循环重新上传到新 Session
+                        current_file_ids = [] 
                     except Exception as create_err:
                         logger.error(f"❌ 重建失败: {create_err}")
                         if req.stream: yield f"data: {json.dumps({'error': {'message': 'Session Recovery Failed'}})}\n\n"
@@ -432,18 +680,59 @@ async def chat(req: ChatRequest, request: Request):
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
 
-async def stream_chat_generator(session: str, text_content: str, file_ids: List[str], model_name: str, chat_id: str, created_time: int, is_stream: bool = True):
-    jwt = await jwt_mgr.get()
+# ---------- JSON Stream Parser ----------
+class JSONStreamParser:
+    def __init__(self):
+        self.buffer_list = [] # Optimization: Use list for O(1) appends
+        self.brace_count = 0
+        self.in_string = False
+        self.escape = False
+        self.started = False 
+
+    def process_chunk(self, chunk: str) -> List[str]:
+        results = []
+        for char in chunk:
+            if not self.started:
+                if char == '{':
+                    self.started = True
+                    self.brace_count = 1
+                    self.buffer_list = ["{"]
+                continue
+            
+            self.buffer_list.append(char)
+            
+            if self.in_string:
+                if self.escape:
+                    self.escape = False
+                elif char == '\\':
+                    self.escape = True
+                elif char == '"':
+                    self.in_string = False
+            else:
+                if char == '"':
+                    self.in_string = True
+                elif char == '{':
+                    self.brace_count += 1
+                elif char == '}':
+                    self.brace_count -= 1
+                    if self.brace_count == 0:
+                        results.append("".join(self.buffer_list))
+                        self.buffer_list = []
+                        self.started = False
+        return results
+
+async def stream_chat_generator(account: Account, session: str, text_content: str, file_ids: List[str], model_name: str, chat_id: str, created_time: int, is_stream: bool = True):
+    jwt = await account.get_jwt()
     headers = get_common_headers(jwt)
     
     body = {
-        "configId": CONFIG_ID,
+        "configId": account.config_id,
         "additionalParams": {"token": "-"},
         "streamAssistRequest": {
             "session": session,
             "query": {"parts": [{"text": text_content}]},
             "filter": "",
-            "fileIds": file_ids, # 注入文件 ID
+            "fileIds": file_ids, 
             "answerGenerationMode": "NORMAL",
             "toolsSpec": {
                 "webGroundingSpec": {},
@@ -467,28 +756,86 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
         chunk = create_chunk(chat_id, created_time, model_name, {"role": "assistant"}, None)
         yield f"data: {chunk}\n\n"
 
-    r = await http_client.post(
-        "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetStreamAssist",
-        headers=headers,
-        json=body,
-    )
+    parser = JSONStreamParser()
     
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=f"Upstream Error {r.text}")
+    # Use incremental decoder to handle multi-byte characters split across chunks
+    import codecs
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     try:
-        data_list = r.json()
-    except Exception as e:
-        logger.error(f"❌ JSON 解析失败: {e}")
-        raise HTTPException(status_code=502, detail="Invalid JSON response")
+        async with http_client.stream(
+            "POST",
+            "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetStreamAssist",
+            headers=headers,
+            json=body,
+        ) as response:
+            if response.status_code != 200:
+                await response.aread()
+                raise HTTPException(status_code=response.status_code, detail=f"Upstream Error {response.text}")
 
-    for data in data_list:
-        for reply in data.get("streamAssistResponse", {}).get("answer", {}).get("replies", []):
-            text = reply.get("groundedContent", {}).get("content", {}).get("text", "")
-            if text and not reply.get("thought"):
-                chunk = create_chunk(chat_id, created_time, model_name, {"content": text}, None)
-                if is_stream:
-                    yield f"data: {chunk}\n\n"
+            # Smoothness Optimization:
+            # The upstream API might return multiple JSON objects in a single chunk or split them.
+            # We want to yield as soon as we have a displayable character.
+            has_started_responding = False
+            
+            async for chunk_bytes in response.aiter_bytes(chunk_size=1024): # Try smaller chunks
+                # Decode bytes incrementally
+                chunk_str = decoder.decode(chunk_bytes, final=False)
+                if not chunk_str:
+                    continue
+                    
+                json_objects = parser.process_chunk(chunk_str)
+                
+                for json_str in json_objects:
+                    try:
+                        data = json.loads(json_str)
+                        # Process the data immediately
+                        for reply in data.get("streamAssistResponse", {}).get("answer", {}).get("replies", []):
+                            content_obj = reply.get("groundedContent", {}).get("content", {})
+                            text = content_obj.get("text", "")
+                            
+                            is_thought = reply.get("thought", False)
+                            
+                            # Optimized Filter Logic:
+                            # If we haven't started responding yet (first token), we aggressively hide thoughts.
+                            # Once valid text appears, we let everything through for speed.
+                            
+                            if not has_started_responding:
+                                if text:
+                                    clean_text = text.strip()
+                                    # Very basic check for thought markers
+                                    if clean_text.startswith("**") and clean_text.endswith("**") and len(clean_text) < 80:
+                                        # Likely a thought header like "**Thought**"
+                                        is_thought = True
+                                    else:
+                                        # Passed the filter
+                                        has_started_responding = True
+                            
+                            # If filtered, log debug but don't yield (increases perceived latency but cleans output)
+                            if is_thought and not has_started_responding:
+                                logger.debug(f"💭 Skipping thought: {text[:20]}...")
+                                continue
+                            
+                            if text:
+                                has_started_responding = True 
+                                chunk = create_chunk(chat_id, created_time, model_name, {"content": text}, None)
+                                if is_stream:
+                                    yield f"data: {chunk}\n\n"
+                                    # Anti-glitch: Small sleep 0 to force IO flush? 
+                                    # Usually not needed in asyncio, but good for tight loops
+                                    # await asyncio.sleep(0) 
+                                else:
+                                    pass
+                    except json.JSONDecodeError:
+                        logger.warning(f"⚠️ 解析 JSON 失败: {json_str[:50]}...")
+                        continue
+
+    except Exception as e:
+        logger.error(f"❌ 流式请求异常: {e}")
+        error_chunk = create_chunk(chat_id, created_time, model_name, {"content": f"\n[Error: {str(e)}]"}, "stop")
+        if is_stream:
+            yield f"data: {error_chunk}\n\n"
+        raise e
     
     if is_stream:
         final_chunk = create_chunk(chat_id, created_time, model_name, {}, "stop")
@@ -496,11 +843,13 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
         yield "data: [DONE]\n\n"
 
 if __name__ == "__main__":
-    if not all([SECURE_C_SES, CSESIDX, CONFIG_ID]):
-        print("Error: Missing required environment variables.")
-        exit(1)
     if not (API_KEY):
         print("Error: Missing API_KEY variables.")
         exit(1)
+    
+    # Initialize Check
+    if not (ENV_SECURE_C_SES or os.getenv("DATABASE_URL")):
+         print("Warning: No Account Configs Found (ENV or DB).")
+
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)

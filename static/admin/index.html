@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Business 账号管理后台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+        }
+
+        .glass {
+            background: rgba(22, 27, 34, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(48, 54, 61, 0.5);
+        }
+
+        .input-dark {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+        }
+
+        .input-dark:focus {
+            border-color: #58a6ff;
+            outline: none;
+        }
+
+        .btn-primary {
+            background: #238636;
+            color: white;
+            transition: all 0.2s;
+        }
+
+        .btn-primary:hover {
+            background: #2ea043;
+        }
+
+        .btn-danger {
+            background: #da3633;
+            color: white;
+            transition: all 0.2s;
+        }
+
+        .btn-danger:hover {
+            background: #f85149;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen">
+    <div id="app" class="max-w-6xl mx-auto p-6">
+        <header
+            class="flex justify-between items-center mb-8 bg-[#161b22] p-4 rounded-2xl border border-gray-800 shadow-lg">
+            <div class="flex items-center gap-3">
+                <div
+                    class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500/20 to-emerald-500/20 flex items-center justify-center border border-blue-500/30">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-blue-400" viewBox="0 0 20 20"
+                        fill="currentColor">
+                        <path
+                            d="M7 3a1 1 0 000 2h6a1 1 0 100-2H7zM4 7a1 1 0 011-1h10a1 1 0 110 2H5a1 1 0 01-1-1zM2 11a2 2 0 012-2h12a2 2 0 012 2v4a2 2 0 01-2 2H4a2 2 0 01-2-2v-4z" />
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold text-white tracking-tight">Gemini Business 账号矩阵</h1>
+                    <p class="text-xs text-gray-500 font-mono">Multi-Account Load Balancer</p>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-3">
+                <button @click="showAddModal = true"
+                    class="group flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600/10 hover:bg-blue-600/20 text-blue-400 border border-blue-600/20 transition-all hover:border-blue-500/50">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 transition-transform group-hover:rotate-90"
+                        viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd"
+                            d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z"
+                            clip-rule="evenodd" />
+                    </svg>
+                    <span class="text-sm font-medium">添加节点</span>
+                </button>
+
+                <div class="h-6 w-px bg-gray-700 mx-1"></div>
+
+                <button v-if="apiKey" @click="logout"
+                    class="flex items-center gap-2 px-3 py-2 rounded-lg text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                    title="退出安全会话">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Loading State -->
+        <div v-if="loading" class="text-center py-20 text-gray-400 animate-pulse">
+            正在加载账号数据...
+        </div>
+
+        <!-- Account List -->
+        <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div v-for="acc in accounts" :key="acc.id"
+                class="glass rounded-xl p-5 relative group hover:border-gray-500 transition-all duration-300">
+
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h3 class="font-bold text-lg text-white mb-1">{{ acc.name }}</h3>
+                        <span
+                            :class="{'bg-emerald-500/10 text-emerald-400 border-emerald-500/20': acc.is_active, 'bg-red-500/10 text-red-400 border-red-500/20': !acc.is_active}"
+                            class="text-xs px-2 py-0.5 rounded border inline-block">
+                            {{ acc.is_active ? '已启用' : '已禁用' }}
+                        </span>
+                    </div>
+                    <div class="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button @click="editAccount(acc)" class="p-1.5 hover:bg-gray-700 rounded text-blue-400"
+                            title="编辑">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
+                                fill="currentColor">
+                                <path
+                                    d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                            </svg>
+                        </button>
+                        <button @click="deleteAccount(acc.id)" class="p-1.5 hover:bg-gray-700 rounded text-red-400"
+                            title="删除">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
+                                fill="currentColor">
+                                <path fill-rule="evenodd"
+                                    d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z"
+                                    clip-rule="evenodd" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="space-y-2 text-sm text-gray-400">
+                    <div class="flex flex-col">
+                        <span class="text-xs font-mono uppercase tracking-widest text-gray-500">配置 ID (Config ID)</span>
+                        <code class="bg-black/30 px-1 py-0.5 rounded">{{ acc.config_id }}</code>
+                    </div>
+                    <div class="flex flex-col">
+                        <span class="text-xs font-mono uppercase tracking-widest text-gray-500">上次使用</span>
+                        <span>{{ formatDate(acc.last_used_at) }}</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Add New Card -->
+            <button @click="showAddModal = true"
+                class="glass rounded-xl p-5 flex flex-col items-center justify-center text-gray-500 hover:text-white hover:border-blue-500/50 transition-all border-dashed">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mb-2" fill="none" viewBox="0 0 24 24"
+                    stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                </svg>
+                <span class="font-medium">添加账号</span>
+            </button>
+        </div>
+
+        <!-- Add/Edit Modal -->
+        <div v-if="showAddModal || editingAccount"
+            class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+            <div class="bg-[#161b22] border border-gray-700 w-full max-w-lg rounded-2xl p-6 shadow-2xl">
+                <h2 class="text-xl font-bold mb-6 text-white">{{ editingAccount ? '编辑账号' : '添加新账号' }}</h2>
+
+                <!-- Batch Import Toggle -->
+                <div v-if="!editingAccount" class="mb-4">
+                    <div class="flex gap-4 border-b border-gray-700 pb-2">
+                        <button @click="importMode = false"
+                            :class="{'text-blue-400 border-b-2 border-blue-400': !importMode, 'text-gray-500': importMode}"
+                            class="pb-1">手动填写</button>
+                        <button @click="importMode = true"
+                            :class="{'text-blue-400 border-b-2 border-blue-400': importMode, 'text-gray-500': !importMode}"
+                            class="pb-1">批量/粘贴导入</button>
+                    </div>
+                </div>
+
+                <div v-if="importMode && !editingAccount">
+                    <label class="block text-sm text-gray-400 mb-2">直接粘贴内容 (支持 SECURE_C_SES=... 格式)</label>
+                    <textarea v-model="importText" @input="parseImport" rows="8"
+                        class="input-dark w-full px-3 py-2 rounded-lg font-mono text-xs"
+                        placeholder="SECURE_C_SES=...&#10;CSESIDX=...&#10;CONFIG_ID=..."></textarea>
+                    <p class="text-xs text-gray-500 mt-2">系统会自动识别 SECURE_C_SES, CSESIDX, CONFIG_ID 等字段</p>
+                </div>
+
+                <form v-else @submit.prevent="submitForm" class="space-y-4">
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">账号名称 (Name)</label>
+                        <input v-model="form.name" type="text" required class="input-dark w-full px-3 py-2 rounded-lg"
+                            placeholder="例如: 个人账号-1">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Cookie: Secure C_SES</label>
+                        <input v-model="form.secure_c_ses" type="text" required
+                            class="input-dark w-full px-3 py-2 rounded-lg font-mono text-xs">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Cookie: Host C_OSES (可选)</label>
+                        <input v-model="form.host_c_oses" type="text"
+                            class="input-dark w-full px-3 py-2 rounded-lg font-mono text-xs">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm text-gray-400 mb-1">CSESIDX</label>
+                            <input v-model="form.csesidx" type="text" required
+                                class="input-dark w-full px-3 py-2 rounded-lg font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-400 mb-1">Config ID</label>
+                            <input v-model="form.config_id" type="text" required
+                                class="input-dark w-full px-3 py-2 rounded-lg font-mono">
+                        </div>
+                    </div>
+
+                    <div v-if="editingAccount" class="flex items-center gap-2 mt-4">
+                        <input type="checkbox" v-model="form.is_active" id="isActive"
+                            class="w-4 h-4 rounded bg-gray-700 border-gray-600">
+                        <label for="isActive" class="text-sm select-none">启用此账号 (Active)</label>
+                    </div>
+
+                    <div class="flex justify-end gap-3 mt-8">
+                        <button type="button" @click="closeModal"
+                            class="px-4 py-2 rounded-lg hover:bg-gray-800 transition-colors">取消</button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">{{ editingAccount ? '保存' : '添加'
+                            }}</button>
+                    </div>
+                </form>
+
+                <div v-if="importMode && !editingAccount" class="flex justify-end gap-3 mt-4">
+                    <button type="button" @click="closeModal"
+                        class="px-4 py-2 rounded-lg hover:bg-gray-800 transition-colors">取消</button>
+                    <button type="button" @click="applyImport" :disabled="!isImportValid"
+                        class="btn-primary px-6 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                        解析并填入
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- API Key Modal -->
+        <div v-if="showAuthModal"
+            class="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4 z-[9999]">
+            <div class="glass w-full max-w-md rounded-2xl p-8 text-center border-blue-500/30">
+                <div
+                    class="mx-auto w-16 h-16 bg-blue-500/20 rounded-full flex items-center justify-center mb-6 text-blue-400">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                </div>
+                <h2 class="text-2xl font-bold text-white mb-2">需要管理员权限</h2>
+                <p class="text-gray-400 mb-6">请输入 API Key 以访问管理控制台</p>
+                <form @submit.prevent="saveKey">
+                    <input v-model="apiKeyInput" type="password" required
+                        class="input-dark w-full px-4 py-3 rounded-xl text-center text-lg mb-4 tracking-widest placeholder:text-gray-600 placeholder:text-sm"
+                        placeholder="sk-...">
+                    <button type="submit"
+                        class="w-full btn-primary py-3 rounded-xl font-bold text-lg shadow-lg shadow-green-900/20">
+                        解锁控制台
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, reactive, computed } = Vue
+
+        createApp({
+            setup() {
+                const accounts = ref([])
+                const loading = ref(true)
+                const showAddModal = ref(false)
+                const editingAccount = ref(null)
+
+                // Auth Logic
+                const showAuthModal = ref(true)
+                const apiKeyInput = ref('')
+                const apiKey = ref(localStorage.getItem('gemini_admin_key') || '')
+
+                // Import Logic
+                const importMode = ref(false)
+                const importText = ref('')
+                const isImportValid = computed(() => {
+                    return form.secure_c_ses && form.csesidx && form.config_id
+                })
+
+                const form = reactive({
+                    name: '',
+                    secure_c_ses: '',
+                    host_c_oses: '',
+                    csesidx: '',
+                    config_id: '',
+                    is_active: true
+                })
+
+                const getHeaders = () => {
+                    return {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey.value}`
+                    }
+                }
+
+                const saveKey = () => {
+                    if (!apiKeyInput.value) return
+                    apiKey.value = apiKeyInput.value
+                    localStorage.setItem('gemini_admin_key', apiKey.value)
+                    showAuthModal.value = false
+                    loadAccounts()
+                }
+
+                const logout = () => {
+                    if (!confirm('确定要退出登录吗？')) return
+                    apiKey.value = ''
+                    localStorage.removeItem('gemini_admin_key')
+                    showAuthModal.value = true
+                    accounts.value = []
+                }
+
+                const parseImport = () => {
+                    const txt = importText.value
+                    const extract = (key) => {
+                        const regex = new RegExp(`${key}\\s*=\\s*([^\\s\\n]+)`)
+                        const match = txt.match(regex)
+                        return match ? match[1].trim() : ''
+                    }
+
+                    const ses = extract('SECURE_C_SES')
+                    const oses = extract('HOST_C_OSES')
+                    const idx = extract('CSESIDX')
+                    const cid = extract('CONFIG_ID')
+
+                    if (ses) form.secure_c_ses = ses
+                    if (oses) form.host_c_oses = oses
+                    if (idx) form.csesidx = idx
+                    if (cid) form.config_id = cid
+
+                    if (ses && !form.name) form.name = `Imported Account ${new Date().toLocaleTimeString()}`
+                }
+
+                const applyImport = () => {
+                    importMode.value = false
+                }
+
+                const loadAccounts = async () => {
+                    if (!apiKey.value) {
+                        showAuthModal.value = true
+                        return
+                    }
+                    showAuthModal.value = false
+                    loading.value = true
+                    try {
+                        const res = await fetch('/api/admin/accounts', { headers: getHeaders() })
+                        if (res.status === 401) {
+                            apiKey.value = ''
+                            localStorage.removeItem('gemini_admin_key')
+                            showAuthModal.value = true
+                            loading.value = false
+                            return
+                        }
+                        if (!res.ok) throw new Error(res.statusText)
+                        accounts.value = await res.json()
+                    } catch (e) {
+                        console.error(e)
+                    } finally {
+                        loading.value = false
+                    }
+                }
+
+                const closeModal = () => {
+                    showAddModal.value = false
+                    editingAccount.value = null
+                    importMode.value = false
+                    importText.value = ''
+                    Object.keys(form).forEach(k => form[k] = '')
+                    form.is_active = true
+                }
+
+                const editAccount = (acc) => {
+                    editingAccount.value = acc
+                    form.name = acc.name
+                    form.secure_c_ses = acc.secure_c_ses
+                    form.host_c_oses = acc.host_c_oses
+                    form.csesidx = acc.csesidx
+                    form.config_id = acc.config_id
+                    form.is_active = acc.is_active
+                }
+
+                const deleteAccount = async (id) => {
+                    if (!confirm('确定要删除/禁用此账号吗？')) return
+                    await fetch(`/api/admin/accounts/${id}`, {
+                        method: 'DELETE',
+                        headers: getHeaders()
+                    })
+                    await loadAccounts()
+                }
+
+                const submitForm = async () => {
+                    const url = editingAccount.value
+                        ? `/api/admin/accounts/${editingAccount.value.id}`
+                        : '/api/admin/accounts'
+                    const method = editingAccount.value ? 'PUT' : 'POST'
+
+                    try {
+                        const res = await fetch(url, {
+                            method,
+                            headers: getHeaders(),
+                            body: JSON.stringify(form)
+                        })
+                        if (!res.ok) throw new Error('Failed')
+                        closeModal()
+                        await loadAccounts()
+                    } catch (e) {
+                        alert('保存失败: ' + e.message)
+                    }
+                }
+
+                const formatDate = (ts) => {
+                    if (!ts) return '从未'
+                    // 假设数据库存的是 UTC 时间 (Postgres默认)，前端补全 Z 强制转为本地时间
+                    if (typeof ts === 'string' && !ts.endsWith('Z') && !ts.includes('+')) {
+                        ts += 'Z'
+                    }
+                    return new Date(ts).toLocaleString()
+                }
+
+                onMounted(() => {
+                    if (apiKey.value) {
+                        loadAccounts()
+                    } else {
+                        showAuthModal.value = true
+                        loading.value = false
+                    }
+                })
+
+                return {
+                    accounts, loading, showAddModal, editingAccount, form,
+                    importMode, importText, isImportValid, parseImport, applyImport,
+                    loadAccounts, closeModal, submitForm, editAccount, deleteAccount, formatDate,
+                    showAuthModal, apiKeyInput, saveKey, logout, apiKey
+                }
+            }
+        }).mount('#app')
+    </script>
+</body>
+
+</html>
