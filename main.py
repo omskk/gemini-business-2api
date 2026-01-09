@@ -216,9 +216,6 @@ class AccountPool:
             # Simple approach: Return the first account. 
             # In a real failover system, we might want to check health, but here we just return index 0
             if self.accounts:
-                 # Update usage stats for the primary account
-                 if self.accounts[0].id > 0:
-                     asyncio.create_task(db.update_account_usage(self.accounts[0].id))
                  return self.accounts[0]
             
             return None
@@ -240,6 +237,7 @@ SESSION_CACHE: Dict[str, dict] = {}
 # Key: client_ip
 # Value: last_stream_model_name
 USER_MODEL_PREF: Dict[str, str] = {}
+GLOBAL_LAST_MODEL_NAME: Optional[str] = None
 
 async def create_google_session(account: Account) -> str:
     jwt = await account.get_jwt()
@@ -523,12 +521,18 @@ async def chat(req: ChatRequest, request: Request):
     
     client_ip = request.client.host if request.client else "global"
     
+    global GLOBAL_LAST_MODEL_NAME
+    
     if req.stream:
         # 用户显式发起对话 -> 更新首选模型记录
         USER_MODEL_PREF[client_ip] = req.model
+        GLOBAL_LAST_MODEL_NAME = req.model
     else:
         # 后台任务 -> 检查是否通过
         preferred = USER_MODEL_PREF.get(client_ip)
+        if not preferred and GLOBAL_LAST_MODEL_NAME:
+            preferred = GLOBAL_LAST_MODEL_NAME
+        
         if preferred and req.model != preferred:
              # 如果后台请求的模型(如2.5)与用户首选(如3)不一致，强制升级
              # 特例：如果用户真的想用2.5发非流式，这里会被误伤，但权衡之下，一致性优先
@@ -600,6 +604,10 @@ async def chat(req: ChatRequest, request: Request):
     async def response_wrapper():
         retry_count = 0
         max_retries = 2
+        
+        # Increment Request Tracking (Once per logical request)
+        if account and account.id > 0:
+            asyncio.create_task(db.increment_account_usage(account.id))
         
         current_text = text_to_send
         current_retry_mode = is_retry_mode

@@ -40,9 +40,13 @@ class DatabaseManager:
                     csesidx TEXT NOT NULL,
                     config_id TEXT NOT NULL,
                     is_active BOOLEAN DEFAULT TRUE,
+                    request_count BIGINT DEFAULT 0,
                     last_used_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                
+                -- Migration: Add column if not exists
+                ALTER TABLE gemini_accounts ADD COLUMN IF NOT EXISTS request_count BIGINT DEFAULT 0;
                 
                 -- Create index for faster lookups if needed
                 CREATE INDEX IF NOT EXISTS idx_accounts_active ON gemini_accounts(is_active);
@@ -63,7 +67,19 @@ class DatabaseManager:
             """)
             return [dict(row) for row in rows]
 
+    async def increment_account_usage(self, account_id: int):
+        if not self.pool:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE gemini_accounts 
+                SET last_used_at = NOW(), request_count = request_count + 1
+                WHERE id = $1
+            """, account_id)
+
     async def update_account_usage(self, account_id: int):
+        # Legacy method, redirect to increment if needed, or just update timestamp
+        # For now, let's just update timestamp to not break compatibility if called elsewhere without intent to increment count
         if not self.pool:
             return
         async with self.pool.acquire() as conn:

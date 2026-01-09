@@ -149,6 +149,10 @@
                         <span class="text-xs font-mono uppercase tracking-widest text-gray-500">上次使用</span>
                         <span>{{ formatDate(acc.last_used_at) }}</span>
                     </div>
+                    <div class="flex flex-col">
+                        <span class="text-xs font-mono uppercase tracking-widest text-gray-500">调用次数</span>
+                        <span class="font-mono text-blue-400">{{ acc.request_count || 0 }}</span>
+                    </div>
                 </div>
             </div>
 
@@ -188,8 +192,10 @@
                         placeholder="SECURE_C_SES=...&#10;CSESIDX=...&#10;CONFIG_ID=..."></textarea>
                     <p class="text-xs text-gray-500 mt-2">系统会自动识别 SECURE_C_SES, CSESIDX, CONFIG_ID 等字段</p>
                     <div class="flex items-center gap-2 mt-2 text-xs text-blue-400">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                            stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>
                         <span>{{ editingAccount ? '编辑模式：粘贴后可切换到"手动填写"调整' : '添加模式：解析后直接填入表单' }}</span>
                     </div>
